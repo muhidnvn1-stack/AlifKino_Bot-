@@ -1,0 +1,243 @@
+import sqlite3, asyncio
+from aiogram import Bot, Dispatcher, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
+
+# ---------------- CONFIG ----------------
+BOT_TOKEN = "8913980313:AAGzzDu9KxxGkW_y7kOPE19SBa3dZvgzQRs"
+ADMIN_ID = 7461662488
+MENU_IMAGE = "https://picsum.photos/800/400" 
+# ----------------------------------------
+
+bot, dp = Bot(token=BOT_TOKEN), Dispatcher()
+db = sqlite3.connect("kinobaza.db")
+cursor = db.cursor()
+
+# Eski xato jadvallarni tozalash
+cursor.execute("DROP TABLE IF EXISTS sozlamalar")
+cursor.execute("DROP TABLE IF EXISTS kanallar")
+db.commit()
+
+# Jadvallarni yaratish
+cursor.execute("CREATE TABLE IF NOT EXISTS kinolar (kod TEXT PRIMARY KEY, file_id TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS foydalanuvchilar (user_id INTEGER PRIMARY KEY)")
+cursor.execute("CREATE TABLE IF NOT EXISTS kanallar (kanal_id TEXT PRIMARY KEY, link TEXT, nomi TEXT)")
+db.commit()
+
+class AdminStates(StatesGroup):
+    kod_kutish = State()
+    kino_kutish = State()
+    k_id_kutish = State()
+    k_link_kutish = State()
+    k_nomi_kutish = State()
+    del_kutish = State()
+
+# --- SHASHOF OYNALI TUGMALAR ---
+
+# Admin boshqaruv paneli
+def get_admin_menu():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="admin_add")],
+            [InlineKeyboardButton(text="➕ Yangi Kanal qo'shish", callback_data="add_channel")],
+            [InlineKeyboardButton(text="❌ Kanalni o'chirish", callback_data="del_channel")],
+            [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stat")]
+        ]
+    )
+
+# Dinamik ravishda barcha majburiy kanallar ro'yxatini chiqarish
+def get_sub_keyboard():
+    cursor.execute("SELECT link, nomi FROM kanallar")
+    kanallar = cursor.fetchall()
+    
+    keyboard = []
+    # Har bir kanalni tugma qilib ro'yxatga qo'shish
+    for i, kanal in enumerate(kanallar, start=1):
+        keyboard.append([InlineKeyboardButton(text=f"📢 {kanal[1]}", url=kanal[0])])
+        
+    # Eng pastiga tekshirish tugmasini qo'shish
+    keyboard.append([InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+# Barcha kanallarga a'zolikni tekshirish funksiyasi
+async def check_subscription(user_id: int) -> bool:
+    if user_id == ADMIN_ID: 
+        return True
+    cursor.execute("SELECT kanal_id FROM kanallar")
+    kanallar = cursor.fetchall()
+    
+    if not kanallar: # Agar bazada hali kanal bo'lmasa, o'tkazib yuboradi
+        return True
+        
+    for kanal in kanallar:
+        try:
+            member = await bot.get_chat_member(chat_id=kanal[0], user_id=user_id)
+            if member.status not in ["member", "administrator", "creator"]:
+                return False
+        except Exception as e:
+            print(f"❌ Kanal tekshirishda xato ({kanal[0]}): {e}")
+            return False # Kanal topilmasa yoki bot admin bo'lmasa ham o'tkazmaydi
+    return True
+
+# --- BOT LOGIKASI ---
+
+@dp.message(F.text == "/start")
+async def start_cmd(message: Message):
+    try:
+        cursor.execute("INSERT OR IGNORE INTO foydalanuvchilar VALUES (?)", (message.from_user.id,))
+        db.commit()
+    except: pass
+
+    if message.from_user.id == ADMIN_ID:
+        return await message.answer_photo(
+            photo=MENU_IMAGE,
+            caption="👋 **Xush kelibsiz, Admin!**\n\nKanallar ro'yxatini shakllantirish va botni boshqarish paneli:",
+            reply_markup=get_admin_menu(),
+            parse_mode="Markdown"
+        )
+
+    # Foydalanuvchini ro'yxatdagi hamma kanalga tekshirish
+    if not await check_subscription(message.from_user.id):
+        await message.answer_photo(
+            photo=MENU_IMAGE,
+            caption="⚠️ **Botdan foydalanish uchun quyidagi barcha kanallarga a'zo bo'lishingiz shart!**\n\nKanallarga kirib a'zo bo'ling va 'Tekshirish' tugmasini bosing.",
+            reply_markup=get_sub_keyboard(),
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer_photo(
+            photo=MENU_IMAGE,
+            caption="👋 **Assalomu alaykum!**\n\nKino ko'rish uchun uning **kodini** yuboring.",
+            parse_mode="Markdown"
+        )
+
+@dp.callback_query(F.data == "check_sub")
+async def check_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    if await check_subscription(user_id):
+        await callback_query.message.delete()
+        await bot.send_message(chat_id=user_id, text="✅ Obuna tasdiqlandi! Kino **kodini** yuborishingiz mumkin.")
+    else:
+        await callback_query.answer("❌ Siz hali barcha kanallarga a'zo bo'lmagansiz!", show_alert=True)
+
+# KINO QIDRISH
+@dp.message(F.text.isdigit())
+async def get_video(message: Message):
+    if not await check_subscription(message.from_user.id):
+        return await message.answer("⚠️ Botdan foydalanish uchun avval hamma kanallarga a'zo bo'ling:", reply_markup=get_sub_keyboard())
+
+    cursor.execute("SELECT file_id FROM kinolar WHERE kod = ?", (message.text,))
+    result = cursor.fetchone()
+    if result:
+        await message.reply_video(video=result[0], caption=f"🎬 Kino kodi: {message.text}")
+    else:
+        await message.reply("🔍 Afsuski, bu kod bilan kino topilmadi.")
+
+# --- ADMIN PANEL LOGIKASI ---
+
+# 1. Yangi kanal qo'shish bosqichlari
+@dp.callback_query(F.data == "add_channel")
+async def add_channel_start(call: CallbackQuery, state: FSMContext):
+    await call.message.answer("Kanal ID sini kiriting (masalan: -1002145678901):")
+    await state.set_state(AdminStates.k_id_kutish)
+    await call.answer()
+
+@dp.message(AdminStates.k_id_kutish)
+async def process_k_id(message: Message, state: FSMContext):
+    await state.update_data(id=message.text)
+    await message.answer("Kanal havolasini (linkini) yuboring (https://t.me/...):")
+    await state.set_state(AdminStates.k_link_kutish)
+
+@dp.message(AdminStates.k_link_kutish)
+async def process_k_link(message: Message, state: FSMContext):
+    await state.update_data(link=message.text)
+    await message.answer("Tugmada ko'rinadigan nom kiriting (masalan: 1-Kanal):")
+    await state.set_state(AdminStates.k_nomi_kutish)
+
+@dp.message(AdminStates.k_nomi_kutish)
+async def process_k_nomi(message: Message, state: FSMContext):
+    data = await state.get_data()
+    cursor.execute("INSERT OR REPLACE INTO kanallar VALUES (?, ?, ?)", (data.get("id"), data.get("link"), message.text))
+    db.commit()
+    await message.answer_photo(
+        photo=MENU_IMAGE,
+        caption="✅ **Yangi kanal majburiy obuna ro'yxatiga muvaffaqiyatli qo'shildi!**",
+        reply_markup=get_admin_menu(),
+        parse_mode="Markdown"
+    )
+    await state.clear()
+
+# 2. Kanalni ro'yxatdan o'chirish
+@dp.callback_query(F.data == "del_channel")
+async def del_channel_start(call: CallbackQuery, state: FSMContext):
+    cursor.execute("SELECT kanal_id, nomi FROM kanallar")
+    kanallar = cursor.fetchall()
+    if not kanallar:
+        return await call.answer("O'chirish uchun kanallar ro'yxati bo'sh!", show_alert=True)
+        
+    matn = "O'chirmoqchi bo'lgan kanalingiz ID sini nusxalab qayta yuboring:\n\n"
+    for k in kanallar:
+        matn += f"📌 {k[1]} -> `{k[0]}`\n"
+    await call.message.answer(matn, parse_mode="Markdown")
+    await state.set_state(AdminStates.del_kutish)
+    await call.answer()
+
+@dp.message(AdminStates.del_kutish)
+async def process_del(message: Message, state: FSMContext):
+    cursor.execute("DELETE FROM kanallar WHERE kanal_id=?", (message.text,))
+    db.commit()
+    await message.answer_photo(
+        photo=MENU_IMAGE,
+        caption="❌ **Kanal ro'yxatdan o'chirib tashlandi!**",
+        reply_markup=get_admin_menu(),
+        parse_mode="Markdown"
+    )
+    await state.clear()
+
+# 3. Kino qo'shish
+@dp.callback_query(F.data == "admin_add")
+async def admin_add_movie(call: CallbackQuery, state: FSMContext):
+    await call.message.answer("Kino uchun yangi kod kiriting:")
+    await state.set_state(AdminStates.kod_kutish)
+    await call.answer()
+
+@dp.message(AdminStates.kod_kutish)
+async def process_kod(message: Message, state: FSMContext):
+    await state.update_data(kino_kodi=message.text)
+    await message.answer("Endi kinoning **videosini** yuboring:")
+    await state.set_state(AdminStates.kino_kutish)
+
+@dp.message(AdminStates.kino_kutish, F.video)
+async def process_video(message: Message, state: FSMContext):
+    data = await state.get_data()
+    cursor.execute("INSERT OR REPLACE INTO kinolar VALUES (?, ?)", (data.get("kino_kodi"), message.video.file_id))
+    db.commit()
+    await message.answer_photo(
+        photo=MENU_IMAGE,
+        caption="✅ **Kino tizimga qo'shildi!**",
+        reply_markup=get_admin_menu(),
+        parse_mode="Markdown"
+    )
+    await state.clear()
+
+# 4. Statistika
+@dp.callback_query(F.data == "admin_stat")
+async def admin_stat(call: CallbackQuery):
+    cursor.execute("SELECT COUNT(*) FROM foydalanuvchilar")
+    u_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM kinolar")
+    k_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM kanallar")
+    ch_count = cursor.fetchone()[0]
+    await call.message.answer_photo(
+        photo=MENU_IMAGE,
+        caption=f"📊 **Statistika:**\n\n👥 Foydalanuvchilar: {u_count} ta\n🎬 Kinolar soni: {k_count} ta\n📢 Homiy kanallar: {ch_count} ta",
+        parse_mode="Markdown",
+        reply_markup=get_admin_menu()
+    )
+    await call.answer()
+
+if __name__ == "__main__":
+    print("Bot xatosiz ishga tushdi...")
+    dp.run_polling(bot)
